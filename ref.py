@@ -41,7 +41,9 @@ class robj: # reflective object
         def name(self):
                 return self.canon.to()
         def type(self):
-                return None
+                return ''
+        def kind(self):
+                return ''
         def add(self, l):
                 if all(not l.same(scan) for scan in self.link):
                         self.link.append(l)
@@ -49,8 +51,8 @@ class robj: # reflective object
                                 self.canon = l
         def names(self):
                 return [l.to() for l in self.link]
-        def value(self):
-                return None
+        def descr(self):
+                return ''
 
 class rlink: # reflective link between reflective objects
         def __init__(self, src, dst, name, embed):
@@ -133,7 +135,7 @@ class rframe(robj):
                         makechildren(self, symtabclosure(symt, []))
 
 def blockrange(start, end, already):
-        return [(p, s, "@" + hex(pc) + n) for pc in range(start, end)
+        return [(p, s, "@" + hex(pc) + ':' + n) for pc in range(start, end)
                 for (p, s, n) in blockclosure(gdb.current_progspace().block_for_pc(pc), already)]
 
 def blockclosure(block, already):
@@ -157,6 +159,12 @@ def symtabclosure(symtab, already):
                                       for (p, s, n) in blockrange(prev, line.pc, already)])
                 prev = line.pc
         return links
+
+def enumname(module, prefix, val):
+        try:
+                return next(n for n, v in vars(module).items() if v == val and n.startswith(prefix))
+        except StopIteration:
+                return "Unknown: {}".format(val)
 
 def symval(sym, frame):
         if sym.addr_class != gdb.SYMBOL_LOC_TYPEDEF:
@@ -201,30 +209,54 @@ class rval(robj):
                         self.a = int(str(val.reference_value())[1:], 16)
                 except Exception:
                         self.a = -1
+                try:
+                        self.printname = str(val)
+                except gdb.MemoryError:
+                        self.printname = '<invalid>'
         def addr(self):
                 return self.a
         def end(self):
                 return (self.a + self.val.type.sizeof) if self.a != -1 else -1
         def type(self):
                 return self.val.type if self.val != None else None
-        def value(self):
-                return self.val
+        def descr(self):
+                return self.printname
+        def kind(self):
+                return enumname(gdb, 'TYPE_CODE_', self.val.type.code) if self.val != None else 'nil'
+        def valwrap(self, code, idx, field):
+                try:
+                        if code == gdb.TYPE_CODE_PTR:
+                                name, embed = '*', False
+                                target = self.val.dereference()
+                        elif code == gdb.TYPE_CODE_ARRAY:
+                                name, embed = '[' + str(idx) + ']', True
+                                target = self.val[idx]
+                        elif code == gdb.TYPE_CODE_STRUCT or \
+                             code == gdb.TYPE_CODE_UNION:
+                                name, embed = '.' + field.name, True
+                                target = self.val[field]
+                        elif code == gdb.TYPE_CODE_REF:
+                                name, embed = '*', False
+                                target = self.val.referenced_value()
+                        child = rval(self.rm, target)
+                except gdb.MemoryError:
+                        child = rill(self.rm)
+                return (child, name, embed)
         def children(self):
                 val = self.val
                 if val == None or val.type == None:
                         return []
                 t = val.type
-                if t.code == gdb.TYPE_CODE_PTR:
-                        kids = [(val.dereference(), '*', False)]
+                if t.code == gdb.TYPE_CODE_PTR or \
+                   t.code == gdb.TYPE_CODE_REF:
+                        kids = [self.valwrap(t.code, 0, None)]
                 elif t.code == gdb.TYPE_CODE_ARRAY:
-                        kids = [(val[i], '[' + str(i) + ']', True) \
-                                        for i in range(t.range()[0], t.range()[1] + 1)]
+                        kids = [self.valwrap(t.code, i, None) \
+                                for i in range(t.range()[0], t.range()[1] + 1)]
                 elif t.code == gdb.TYPE_CODE_STRUCT or \
                      t.code == gdb.TYPE_CODE_UNION:
-                        kids = [(val[field], '.' + field.name, True) \
+                        kids = [self.valwrap(t.code, 0, field) \
                                 for field in t.fields()]
-                elif t.code == gdb.TYPE_CODE_REF:
-                        kids = [(val.referenced_value(), '*', False)]
                 elif t.code in [gdb.TYPE_CODE_FLAGS,
                                 gdb.TYPE_CODE_ENUM,
                                 gdb.TYPE_CODE_FUNC,
@@ -258,8 +290,15 @@ class rval(robj):
                 else:
                         print('0!!!')
                         assert(0)
-                return [rlink(self, rval(self.rm, val), name, embed)
-                        for (val, name, embed) in kids]
+                return [rlink(self, child, name, embed) for (child, name, embed) in kids]
+
+class rill(robj):
+        def __init__(self, rm):
+                super().__init__(rm)
+        def children(self):
+                return []
+        def name(self):
+                return '<ill>'
 
 class reflect(gdb.Command):
         """Test.
@@ -272,32 +311,36 @@ Documented.
         def invoke(self, arg, from_tty):
                 self.scanall()
         def scanall(self):
-                rm = rmap()
-                self.front = [rroot(rm)]
+                self.rm = rmap()
+                self.front = {rroot(self.rm)}
                 self.closure()
-                for (addr, ro) in rm.mem:
-                        print('{:14x} {:32}: {} {}'.format(addr, ro.name(), ro.value(),
-                                                           [n for n in ro.names() if n != ro.name()]))
-                #self.graph(rm)
+                self.printfront()
+                #self.graph()
         def closure(self):
-                front = self.front
-                while len(front) > 0:
-                        ro = front.pop()
-                        print(ro, front, ro.mark) if ro in front or ro.mark else 0
-                        assert ro not in front and not ro.mark
+                while len(self.front) > 0:
+                        ro = self.front.pop()
+                        if ro in self.front or ro.mark:
+                                print(ro.descr())
+                                self.printfront()
+                        assert ro not in self.front and not ro.mark
                         ro.mark = True
-                        front.extend(set([l.dst for l in ro.children() if not l.dst.mark]))
-        def graph(self, rm):
+                        self.front |= {l.dst for l in ro.children() if not l.dst.mark}
+        def graph(self):
                 idx = {}
                 n = 0
-                for (addr, ro) in rm.mem:
+                for (addr, ro) in self.rm.mem:
                         idx[ro] = n
                         n += 1
-                for (addr, ro) in rm.mem:
+                for (addr, ro) in self.rm.mem:
                         print('    n{} [label="{:x}"]'.format(idx[ro], ro.addr()))
-                for (addr, ro) in rm.mem:
+                for (addr, ro) in self.rm.mem:
                         for l in ro.link:
                                 print('    n{} -> n{} [label="{}"]'.format(idx[l.src], idx[ro], l.name))
-reflect()
+        def printfront(self):
+                for (addr, ro) in self.rm.mem:
+                        print('{:14x} {:32}: {:20} {:12} {} {}'.format(addr, ro.name(), ro.descr(), ro.kind(), ro.type(), 
+                                                                       [n for n in ro.names() if n != ro.name()]))
 
+reflect()
+gdb.execute('set height 0')
 print('reflect loaded.')
