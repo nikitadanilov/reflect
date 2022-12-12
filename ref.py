@@ -114,10 +114,15 @@ class rframe(robj):
                 super().__init__(rm)
                 self.frame  = frame
                 self.thread = thread
+                try:
+                        self.block = frame.block()
+                except RuntimeError: # Cannot locate block for frame.
+                        print('Cannot locate block for frame: ', frame.level())
+                        self.block = None
         def addr(self):
-                return self.frame.block().start
+                return self.block.start if self.block != None else -1
         def end(self):
-                return self.frame.block().end
+                return self.block.end if self.block != None else -1
         def same(self, other):
                 return  self.thread.same(other.thread) and \
                         self.frame.level == other.frame.level
@@ -125,38 +130,59 @@ class rframe(robj):
                 function = (self.frame.name() + '()') if self.frame.name() else ''
                 return super().name() + ':' + function
         def children(self):
+                if self.block == None:
+                        return []
                 sal   = self.frame.find_sal()
                 symt  = sal.symtab
                 prog  = gdb.current_progspace()
                 return  [rlink(self, rblock(self.rm, b, f, n), '', False)
-                         for (b, f, n) in ([(self.frame.block(),    self, self.name() + '.text')] + \
+                         for (b, f, n) in ([(self.block, self, self.name() + '.text')] + \
                                            [(prog.block_for_pc(pc), self, '')
-                                            for pc in range(sal.pc, sal.last)])] + \
-                        makechildren(self, symtabclosure(symt, []))
+                                            for pc in (range(sal.pc, sal.last)
+                                            # sometimes sal has no valid addresses:
+                                            #    symbol and line for /usr/src/debug/gcc-4.8.5-20150702/obj-x86_64-redhat-linux/x86_64-redhat-linux/libstdc++-v3/include/bits/ostream_insert.h, line 50 7 0 None
+                                                       if sal.pc and sal.last else [])])] + \
+                        makechildren(self, symtabclosure(symt, [], {}))
 
-def blockrange(start, end, already):
+def blockrange(start, end, already, scanned):
+        return []
+        if any(b <= start and end <= scanned[b] for b in scanned):
+                return []
+        scanned[start] = end
+        more = True
+        while more:
+                more = False
+                for b in scanned:
+                        e = scanned[b]
+                        if e in scanned:
+                                scanned[b] = scanned[e]
+                                del scanned[e]
+                                more = True
+        print(scanned)
+        if end - start > 1000000:
+                print('scanning range: {:x} ... {:x} ({})'.format(start, end, end - start)) 
         return [(p, s, "@" + hex(pc) + ':' + n) for pc in range(start, end)
-                for (p, s, n) in blockclosure(gdb.current_progspace().block_for_pc(pc), already)]
+                for (p, s, n) in blockclosure(gdb.current_progspace().block_for_pc(pc), already, scanned)]
 
-def blockclosure(block, already):
+def blockclosure(block, already, scanned):
         if block == None or any(block.start == b.start and block.end == b.end for b in already):
                 return []
         else:
                 already.append(block)
-                return  blockclosure(block.superblock,   already) + \
-                        blockclosure(block.global_block, already) + \
-                        blockclosure(block.static_block, already) + \
-                        blockrange(block.start, block.end, already) + \
+                return  blockclosure(block.superblock,     already, scanned) + \
+                        blockclosure(block.global_block,   already, scanned) + \
+                        blockclosure(block.static_block,   already, scanned) + \
+                        blockrange(block.start, block.end, already, scanned) + \
                         [(block, s, s.name) for s in block if not s.needs_frame]
 
-def symtabclosure(symtab, already):
+def symtabclosure(symtab, already, scanned):
         prev = None
-        links = blockclosure(symtab.global_block(), already) + \
-                blockclosure(symtab.static_block(), already)
+        links = blockclosure(symtab.global_block(), already, scanned) + \
+                blockclosure(symtab.static_block(), already, scanned)
         for line in symtab.linetable():
                 if prev:
                         links.extend([(p, s, "#" + str(line.line) + n)
-                                      for (p, s, n) in blockrange(prev, line.pc, already)])
+                                      for (p, s, n) in blockrange(prev, line.pc, already, scanned)])
                 prev = line.pc
         return links
 
@@ -167,11 +193,19 @@ def enumname(module, prefix, val):
                 return "Unknown: {}".format(val)
 
 def symval(sym, frame):
-        if sym.addr_class != gdb.SYMBOL_LOC_TYPEDEF:
-                if frame != None and frame.frame != None:
-                        val = sym.value(frame.frame)
-                else:
-                        val = sym.value()
+        if sym.addr_class == gdb.SYMBOL_LOC_LABEL:
+                # work around gdb internal error
+                val = None
+        elif sym.addr_class != gdb.SYMBOL_LOC_TYPEDEF:
+                try:
+                        if frame != None and frame.frame != None:
+                                val = sym.value(frame.frame)
+                        else:
+                                val = sym.value()
+                except gdb.error as e:
+                        # e.g., 'Cannot find thread-local variables on this target'
+                        print('Cannot find value: ', e)
+                        val = None
         else:
                 val = None
         return val
@@ -198,7 +232,7 @@ class rblock(robj):
         def children(self):
                 parent = self.frame if self.frame != None else self
                 return [rlink(parent, rval(self.rm, symval(sym, self.frame)), ':' + self.symname(sym), False)
-                        for sym in self.block] + makechildren(self, blockclosure(self.block, []))
+                        for sym in self.block] + makechildren(self, blockclosure(self.block, [], {}))
 
 
 class rval(robj):
@@ -233,14 +267,18 @@ class rval(robj):
                                 target = self.val[idx]
                         elif code == gdb.TYPE_CODE_STRUCT or \
                              code == gdb.TYPE_CODE_UNION:
-                                name, embed = '.' + field.name, True
+                                name, embed = '.' + (field.name if field.name != None else '<noname>'), True
                                 target = self.val[field]
                         elif code == gdb.TYPE_CODE_REF:
                                 name, embed = '*', False
                                 target = self.val.referenced_value()
+                        else:
+                                assert('Code: {}' + self.kind() == None)
                         child = rval(self.rm, target)
                 except gdb.MemoryError:
                         child = rill(self.rm)
+                except gdb.error: # gdb.error: Attempt to dereference a generic pointer
+                        child = rval(self.rm, gdb.parse_and_eval('(void)0'))
                 return (child, name, embed)
         def children(self):
                 val = self.val
@@ -332,10 +370,11 @@ Documented.
                         idx[ro] = n
                         n += 1
                 for (addr, ro) in self.rm.mem:
-                        print('    n{} [label="{:x}"]'.format(idx[ro], ro.addr()))
+                        print('    n{} [label="{}@{:x}"]'.format(idx[ro], ro.descr().replace('"', '\\"'), ro.addr()))
                 for (addr, ro) in self.rm.mem:
                         for l in ro.link:
-                                print('    n{} -> n{} [label="{}"]'.format(idx[l.src], idx[ro], l.name))
+                                if ro in idx and l.src in idx:
+                                        print('    n{} -> n{} [label="{}"]'.format(idx[l.src], idx[ro], l.name))
         def printfront(self):
                 for (addr, ro) in self.rm.mem:
                         print('{:14x} {:32}: {:20} {:12} {} {}'.format(addr, ro.name(), ro.descr(), ro.kind(), ro.type(), 
