@@ -142,7 +142,10 @@ class rframe(robj):
                                             # sometimes sal has no valid addresses:
                                             #    symbol and line for /usr/src/debug/gcc-4.8.5-20150702/obj-x86_64-redhat-linux/x86_64-redhat-linux/libstdc++-v3/include/bits/ostream_insert.h, line 50 7 0 None
                                                        if sal.pc and sal.last else [])])] + \
-                        makechildren(self, symtabclosure(symt, [], {}))
+                        makechildren(self, symtabclosure(symt, [], {})) + \
+                        [rlink(self, rval(self.rm,
+                                          gdb.parse_and_eval('(void *){}'.format(self.frame.pc()))),
+                                          '.return', False)]
 
 def blockrange(start, end, already, scanned):
         return []
@@ -352,7 +355,7 @@ Documented.
                 self.rm = rmap()
                 self.front = {rroot(self.rm)}
                 self.closure()
-                self.printfront()
+                self.mapprint()
                 #self.graph()
         def closure(self):
                 while len(self.front) > 0:
@@ -375,7 +378,7 @@ Documented.
                         for l in ro.link:
                                 if ro in idx and l.src in idx:
                                         print('    n{} -> n{} [label="{}"]'.format(idx[l.src], idx[ro], l.name))
-        def printfront(self):
+        def mapprint(self):
                 for (addr, ro) in self.rm.mem:
                         print('{:14x} {:32}: {:20} {:12} {} {}'.format(addr, ro.name(), ro.descr(), ro.kind(), ro.type(), 
                                                                        [n for n in ro.names() if n != ro.name()]))
